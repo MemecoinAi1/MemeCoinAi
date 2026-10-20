@@ -1,0 +1,628 @@
+ <!DOCTYPE html>
+<html lang="de" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>MEMECOIN AI - Live Scanner & Pump.fun Intelligence</title>
+  
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#030712" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: { gray: { 950: '#030712' } }
+        }
+      }
+    }
+  </script>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    .pb-safe { padding-bottom: env(safe-area-inset-bottom, 1rem); }
+    .pt-safe { padding-top: env(safe-area-inset-top, 0.5rem); }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 antialiased selection:bg-indigo-500 selection:text-white font-sans">
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const DEXSCREENER_BASE = 'https://api.dexscreener.com/latest/dex';
+
+    // Live-Daten Abfrage mit AbortController und Mint-Deduplizierung
+    async function fetchLiveTokens(query = 'solana', signal) {
+      try {
+        const res = await fetch(`${DEXSCREENER_BASE}/search?q=${encodeURIComponent(query)}`, { signal });
+        if (!res.ok) return { pairs: [], error: `DEX API Fehler: HTTP ${res.status}` };
+        const data = await res.json();
+        let pairs = data.pairs || [];
+
+        if (pairs.length === 0 && query !== 'solana') {
+          const fallbackRes = await fetch(`${DEXSCREENER_BASE}/search?q=solana`, { signal });
+          const fallbackData = await fallbackRes.json();
+          pairs = fallbackData.pairs || [];
+        }
+
+        const uniqueMap = new Map();
+        for (const p of pairs) {
+          const mint = p?.baseToken?.address;
+          if (mint && !uniqueMap.has(mint)) {
+            uniqueMap.set(mint, p);
+          } else if (!mint && p?.pairAddress && !uniqueMap.has(p.pairAddress)) {
+            uniqueMap.set(p.pairAddress, p);
+          }
+        }
+        return { pairs: Array.from(uniqueMap.values()) };
+      } catch (err) {
+        if (err.name === 'AbortError') return { pairs: [], isAborted: true };
+        return { pairs: [], error: `Netzwerkfehler: ${err.message || 'Verbindung fehlgeschlagen'}` };
+      }
+    }
+
+    async function fetchTokensByWatchlist(watchlistItems, signal) {
+      if (!watchlistItems || watchlistItems.length === 0) return { pairs: [] };
+      try {
+        const validItems = watchlistItems.filter(item => item && item.pairAddress);
+        if (validItems.length === 0) return { pairs: [] };
+
+        const chainId = validItems[0].chainId || 'solana';
+        const addresses = validItems.map(i => i.pairAddress).slice(0, 30).join(',');
+
+        const res = await fetch(`${DEXSCREENER_BASE}/pairs/${chainId}/${addresses}`, { signal });
+        if (!res.ok) return { pairs: [] };
+        const data = await res.json();
+        return { pairs: data.pairs || [] };
+      } catch (err) {
+        if (err.name === 'AbortError') return { pairs: [], isAborted: true };
+        return { pairs: [] };
+      }
+    }
+
+    function evaluateRisk(token) {
+      if (!token) {
+        return {
+          level: 'NICHT GENÜGEND DATEN',
+          score: 0,
+          findings: [{ title: 'Keine Daten', desc: 'Keine Token-Metriken zur Analyse verfügbar.', source: 'System', reliability: 'Nicht genügend Daten' }]
+        };
+      }
+
+      let score = 0;
+      const findings = [];
+      let hasEssentialData = true;
+
+      const liq = token.liquidity?.usd;
+      if (liq === undefined || liq === null || isNaN(liq)) {
+        hasEssentialData = false;
+        findings.push({
+          title: 'Liquiditätsdaten fehlen',
+          desc: 'Ohne verifizierte Liquiditätsdaten kann kein vertretbares Risiko ermittelt werden.',
+          source: 'Indexierte DEX-Daten',
+          reliability: 'Unbekannte Information'
+        });
+      } else {
+        if (liq < 5000) {
+          score += 40;
+          findings.push({
+            title: 'Extrem niedrige Liquidität (< $5.000)',
+            desc: 'Sehr geringe Tiefe des Pools erhöht das Risiko von Slippage oder Unverkäuflichkeit.',
+            source: 'Liquiditätsprüfung',
+            reliability: 'Verdachtsmoment'
+          });
+        } else if (liq < 25000) {
+          score += 20;
+          findings.push({
+            title: 'Geringe Liquidität (< $25.000)',
+            desc: 'Handelsvolumen kann den Kurs stark beeinflussen.',
+            source: 'Liquiditätsprüfung',
+            reliability: 'Bestätigter Fakt'
+          });
+        }
+      }
+
+      if (token.pairCreatedAt) {
+        const ageHours = (Date.now() - token.pairCreatedAt) / (1000 * 60 * 60);
+        if (ageHours < 1) {
+          score += 35;
+          findings.push({
+            title: 'Frisches Handelspaar (< 1 Std indexiert)',
+            desc: 'Erhöhtes Risiko von starker Volatilität.',
+            source: 'Zeitstempel-Analyse',
+            reliability: 'Bestätigter Fakt'
+          });
+        }
+      }
+
+      if (!hasEssentialData) {
+        return { level: 'NICHT GENÜGEND DATEN', score, findings };
+      }
+
+      if (findings.length === 0) {
+        findings.push({
+          title: 'Keine akuten Warnsignale in Marktdaten',
+          desc: 'Auf Basis der verfügbaren Metriken keine Auffälligkeiten. Dies ist keine Sicherheitsgarantie.',
+          source: 'Regelbasierter Vorfilter',
+          reliability: 'Bestätigter Fakt'
+        });
+      }
+
+      let level = 'NIEDRIGES ERKANNTES RISIKO';
+      if (score >= 60) level = 'ERHÖHTES RISIKO';
+      else if (score >= 30) level = 'MITTLERES RISIKO';
+
+      return { level, score, findings };
+    }
+
+    function formatUSD(val) {
+      if (val === undefined || val === null || isNaN(val)) return 'Keine Daten';
+      const num = Number(val);
+      if (num === 0) return '$0.00';
+      if (num < 0.0001) return `$${num.toExponential(2)}`;
+      return `$${num.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 6 })}`;
+    }
+
+    function formatChange(val) {
+      if (val === undefined || val === null || isNaN(val)) return '0.0%';
+      return `${val > 0 ? '+' : ''}${Number(val).toFixed(1)}%`;
+    }
+
+    function formatAge(timestamp) {
+      if (!timestamp) return 'Live';
+      const hours = Math.floor((Date.now() - timestamp) / (1000 * 60 * 60));
+      if (hours < 1) {
+        const mins = Math.floor((Date.now() - timestamp) / (1000 * 60));
+        return `${Math.max(1, mins)}m alt`;
+      }
+      if (hours > 24) {
+        return `${Math.floor(hours / 24)}d alt`;
+      }
+      return `${hours}h alt`;
+    }
+
+    function RiskBadge({ level }) {
+      const getStyle = () => {
+        switch (level) {
+          case 'NIEDRIGES ERKANNTES RISIKO': return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30';
+          case 'MITTLERES RISIKO': return 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+          case 'ERHÖHTES RISIKO': return 'bg-red-500/10 text-red-400 border-red-500/30';
+          default: return 'bg-gray-500/10 text-gray-400 border-gray-500/30';
+        }
+      };
+      return <span className={`px-2 py-0.5 text-[10px] font-bold rounded-full border uppercase tracking-wider ${getStyle()}`}>{level}</span>;
+    }
+
+    function BottomNav({ activeTab, setActiveTab }) {
+      const items = [
+        { id: 'scanner', label: 'Scanner', icon: '⚡' },
+        { id: 'pumpfun', label: 'Pump.fun', icon: '🔥' },
+        { id: 'sniper', label: 'Sniper', icon: '🎯' },
+        { id: 'watchlist', label: 'Watchlist', icon: '⭐' },
+        { id: 'wallet', label: 'Wallet', icon: '👛' },
+      ];
+      return (
+        <nav className="fixed bottom-0 left-0 right-0 bg-gray-950/90 backdrop-blur-lg border-t border-gray-800/80 z-50 pb-safe">
+          <div className="flex justify-around items-center h-16 max-w-md mx-auto px-2">
+            {items.map(item => (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`flex flex-col items-center justify-center w-full h-full text-[10px] font-medium transition-all ${
+                  activeTab === item.id ? 'text-indigo-400 font-bold scale-105' : 'text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                <span className="text-xl mb-0.5">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </nav>
+      );
+    }
+
+    function App() {
+      const [activeTab, setActiveTab] = useState('scanner');
+      const [scannerCategory, setScannerCategory] = useState('NEW');
+      const [tokens, setTokens] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+      const [searchQuery, setSearchQuery] = useState('solana');
+      const [selectedCoin, setSelectedCoin] = useState(null);
+
+      // Pump.fun State
+      const [pumpTokens, setPumpTokens] = useState([]);
+      const [pumpLoading, setPumpLoading] = useState(false);
+      const [pumpError, setPumpError] = useState(null);
+      const [pumpLastUpdated, setPumpLastUpdated] = useState(null);
+      const [pumpSearch, setPumpSearch] = useState('');
+
+      const [sortBy, setSortBy] = useState('newest');
+      const [minLiquidity, setMinLiquidity] = useState('');
+      const [minVolume, setMinVolume] = useState('');
+
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [isStale, setIsStale] = useState(false);
+
+      const [watchlist, setWatchlist] = useState(() => {
+        try {
+          const saved = localStorage.getItem('memecoin_ai_watchlist_v11');
+          if (!saved) return [];
+          const parsed = JSON.parse(saved);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+          return [];
+        }
+      });
+      const [watchlistTokens, setWatchlistTokens] = useState([]);
+      const [watchlistLoading, setWatchlistLoading] = useState(false);
+      const [watchlistError, setWatchlistError] = useState(null);
+
+      const [chatMessages, setChatMessages] = useState([]);
+      const [chatInput, setChatInput] = useState('');
+
+      const abortControllerRef = useRef(null);
+      const pumpAbortRef = useRef(null);
+      const watchlistAbortRef = useRef(null);
+
+      useEffect(() => {
+        try {
+          localStorage.setItem('memecoin_ai_watchlist_v11', JSON.stringify(watchlist));
+        } catch (e) {}
+      }, [watchlist]);
+
+      const loadData = async (isBackground = false) => {
+        if (abortControllerRef.current) abortControllerRef.current.abort();
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+
+        if (!isBackground) setLoading(true);
+        setError(null);
+
+        const result = await fetchLiveTokens(searchQuery, controller.signal);
+        if (result.isAborted) return;
+
+        if (result.error) {
+          setError(result.error);
+          setIsStale(true);
+        } else {
+          setTokens(result.pairs);
+          setLastUpdated(new Date());
+          setIsStale(false);
+        }
+        setLoading(false);
+      };
+
+      const loadPumpTokens = async (isBackground = false) => {
+        if (pumpAbortRef.current) pumpAbortRef.current.abort();
+        const controller = new AbortController();
+        pumpAbortRef.current = controller;
+
+        if (!isBackground) setPumpLoading(true);
+        setPumpError(null);
+
+        const result = await fetchLiveTokens('pump.fun', controller.signal);
+        if (result.isAborted) return;
+
+        if (result.error) {
+          setPumpError(`Datenabruf eingeschränkt: ${result.error}`);
+        } else {
+          const strictPump = result.pairs.filter(p => 
+            (p.dexId && p.dexId.toLowerCase().includes('pump')) || 
+            (p.url && p.url.toLowerCase().includes('pump.fun'))
+          );
+          const sorted = strictPump.sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0)).slice(0, 50);
+          setPumpTokens(sorted);
+          setPumpLastUpdated(new Date());
+        }
+        setPumpLoading(false);
+      };
+
+      useEffect(() => {
+        loadData(false);
+        loadPumpTokens(false);
+
+        const interval = setInterval(() => {
+          loadData(true);
+          loadPumpTokens(true);
+        }, 30000);
+
+        return () => {
+          clearInterval(interval);
+          if (abortControllerRef.current) abortControllerRef.current.abort();
+          if (pumpAbortRef.current) pumpAbortRef.current.abort();
+        };
+      }, [searchQuery]);
+
+      useEffect(() => {
+        if (activeTab === 'watchlist') {
+          if (watchlist.length === 0) {
+            setWatchlistTokens([]);
+            setWatchlistLoading(false);
+            return;
+          }
+
+          if (watchlistAbortRef.current) watchlistAbortRef.current.abort();
+          const controller = new AbortController();
+          watchlistAbortRef.current = controller;
+
+          setWatchlistLoading(true);
+          setWatchlistError(null);
+
+          fetchTokensByWatchlist(watchlist, controller.signal).then(res => {
+            if (controller.signal.aborted) return;
+            setWatchlistTokens(res.pairs);
+            setWatchlistLoading(false);
+          });
+        }
+      }, [activeTab, watchlist]);
+
+      const toggleWatchlist = (token, e) => {
+        if (e) e.stopPropagation();
+        if (!token || !token.pairAddress) return;
+        
+        setWatchlist(prev => {
+          const exists = prev.some(item => item.pairAddress === token.pairAddress);
+          if (exists) {
+            return prev.filter(item => item.pairAddress !== token.pairAddress);
+          } else {
+            return [...prev, { 
+              pairAddress: token.pairAddress, 
+              chainId: token.chainId || 'solana',
+              mintAddress: token.baseToken?.address || '' 
+            }];
+          }
+        });
+      };
+
+      const getProcessedTokens = () => {
+        let list = [...tokens];
+        if (scannerCategory === 'NEW') {
+          list = list.sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+        } else if (scannerCategory === 'VOLUME') {
+          list = list.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
+        } else if (scannerCategory === 'TRENDING') {
+          list = list.sort((a, b) => (b.priceChange?.h24 || 0) - (a.priceChange?.h24 || 0));
+        }
+        return list;
+      };
+
+      const processedTokens = getProcessedTokens();
+
+      const getProcessedPumpTokens = () => {
+        let list = [...pumpTokens];
+        if (pumpSearch.trim() !== '') {
+          const q = pumpSearch.toLowerCase();
+          list = list.filter(t => 
+            (t.baseToken?.name && t.baseToken.name.toLowerCase().includes(q)) ||
+            (t.baseToken?.symbol && t.baseToken.symbol.toLowerCase().includes(q)) ||
+            (t.baseToken?.address && t.baseToken.address.toLowerCase().includes(q))
+          );
+        }
+        return list;
+      };
+
+      const processedPumpTokens = getProcessedPumpTokens();
+
+      const handleSendMessage = () => {
+        if (!chatInput.trim() || !selectedCoin) return;
+        const msg = chatInput;
+        setChatMessages(prev => [...prev, { sender: 'Du', text: msg }]);
+        setChatInput('');
+
+        setTimeout(() => {
+          const risk = evaluateRisk(selectedCoin);
+          let reply = `[KI-Agenten Analyse für ${selectedCoin.baseToken?.symbol || 'Token'}]: Preis: ${formatUSD(selectedCoin.priceUsd)}. Liquidität: ${formatUSD(selectedCoin.liquidity?.usd)}. Risiko: ${risk.level}.`;
+          setChatMessages(prev => [...prev, { sender: 'KI Agent', text: reply }]);
+        }, 500);
+      };
+
+      return (
+        <div className="min-h-screen bg-gray-950 text-gray-100 pb-24 font-sans pt-safe">
+          <header className="sticky top-0 z-40 bg-gray-950/85 backdrop-blur-md border-b border-gray-800/80 px-4 py-3 flex justify-between items-center">
+            <div className="flex items-center space-x-2">
+              <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center font-black text-white text-sm shadow-lg shadow-indigo-500/20">
+                🤖
+              </div>
+              <div>
+                <span className="text-base font-black tracking-wider bg-gradient-to-r from-indigo-400 via-purple-300 to-pink-400 bg-clip-text text-transparent">
+                  MEMECOIN AI
+                </span>
+                <span className="block text-[9px] text-gray-500 font-mono -mt-1">Live Intelligence v2.0</span>
+              </div>
+            </div>
+            <button 
+              onClick={() => setActiveTab('premium')}
+              className="bg-gradient-to-r from-amber-500 to-orange-500 text-black text-xs font-bold px-3 py-1.5 rounded-full shadow-md transition"
+            >
+              👑 PRO
+            </button>
+          </header>
+
+          <main className="max-w-md mx-auto p-4 space-y-4">
+            
+            {/* TAB: GENERAL SCANNER */}
+            {activeTab === 'scanner' && (
+              <div className="space-y-3">
+                <div className="relative">
+                  <input
+                    type="text"
+                    placeholder="Suche Name, Symbol oder Token-Adresse..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full bg-gray-900 border border-gray-800 rounded-xl pl-9 pr-9 py-2.5 text-xs text-gray-100 placeholder-gray-500 focus:outline-none focus:border-indigo-500"
+                  />
+                  <span className="absolute left-3 top-2.5 text-gray-500 text-sm">🔍</span>
+                </div>
+
+                <div className="flex justify-between items-center px-1 text-[10px] text-gray-400">
+                  <div className="flex items-center gap-1.5">
+                    <span className={`w-2 h-2 rounded-full ${isStale ? 'bg-amber-500' : 'bg-emerald-500 animate-pulse'}`}></span>
+                    <span>{lastUpdated ? `Stand: ${lastUpdated.toLocaleTimeString('de-DE')}` : 'Wird geladen...'}</span>
+                  </div>
+                  <button onClick={() => loadData(false)} className="text-indigo-400 hover:underline">🔄 Aktualisieren</button>
+                </div>
+
+                <div className="flex gap-1.5 overflow-x-auto pb-1 text-xs no-scrollbar">
+                  {[
+                    { id: 'NEW', label: '🔥 Neu' },
+                    { id: 'TRENDING', label: '📈 Trending' },
+                    { id: 'VOLUME', label: '💎 Volumen' },
+                  ].map(cat => (
+                    <button
+                      key={cat.id}
+                      onClick={() => setScannerCategory(cat.id)}
+                      className={`px-3 py-1.5 rounded-lg font-medium whitespace-nowrap transition ${
+                        scannerCategory === cat.id ? 'bg-indigo-600 text-white shadow-md' : 'bg-gray-900 border border-gray-800 text-gray-400'
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+
+                {loading && <div className="py-12 text-center text-gray-500 text-xs animate-pulse">Lade Live-Märkte...</div>}
+                {error && <div className="bg-red-500/10 border border-red-500/30 p-3 rounded-xl text-xs text-red-400">⚠️ {error}</div>}
+
+                <div className="space-y-2.5">
+                  {processedTokens.map((token) => {
+                    const risk = evaluateRisk(token);
+                    const isSaved = watchlist.some(item => item.pairAddress === token.pairAddress);
+                    return (
+                      <div
+                        key={token.pairAddress}
+                        onClick={() => setSelectedCoin(token)}
+                        className="bg-gray-900/70 border border-gray-800 hover:border-indigo-500/50 p-3.5 rounded-2xl cursor-pointer transition"
+                      >
+                        <div className="flex justify-between items-start">
+                          <div className="flex items-center space-x-3">
+                            <div className="w-9 h-9 rounded-full bg-indigo-600/20 text-indigo-400 flex items-center justify-center font-bold text-xs">
+                              {token.baseToken?.symbol?.slice(0, 3) || '???'}
+                            </div>
+                            <div>
+                              <h3 className="font-bold text-sm text-gray-100">{token.baseToken?.name || 'Keine Daten'}</h3>
+                              <p className="text-[10px] text-gray-500 uppercase font-mono">${token.baseToken?.symbol}</p>
+                            </div>
+                          </div>
+                          <button onClick={(e) => toggleWatchlist(token, e)} className={`text-base p-1 ${isSaved ? 'text-amber-400' : 'text-gray-500'}`}>
+                            {isSaved ? '⭐' : '☆'}
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 mt-3 pt-2.5 border-t border-gray-800 text-[11px]">
+                          <div>Preis: <span className="font-mono">{formatUSD(token.priceUsd)}</span></div>
+                          <div>Vol: <span className="font-mono">{formatUSD(token.volume?.h24)}</span></div>
+                          <div>Change: <span className="font-mono text-emerald-400">{formatChange(token.priceChange?.h24)}</span></div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* TAB: PUMP.FUN */}
+            {activeTab === 'pumpfun' && (
+              <div className="space-y-3">
+                <div className="bg-gradient-to-r from-orange-950/50 to-pink-950/50 border border-orange-500/30 p-4 rounded-2xl space-y-1">
+                  <h2 className="text-base font-bold text-orange-400">🔥 Pump.fun Live-Scanner</h2>
+                  <p className="text-xs text-gray-300">Verifizierter DexScreener-Index für Pump.fun-Launches.</p>
+                </div>
+
+                <input
+                  type="text"
+                  placeholder="Filter Pump.fun Token..."
+                  value={pumpSearch}
+                  onChange={(e) => setPumpSearch(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-800 rounded-xl px-3 py-2 text-xs text-white"
+                />
+
+                {pumpLoading && <div className="py-12 text-center text-gray-500 text-xs animate-pulse">Lade Pump.fun...</div>}
+                {pumpError && <div className="bg-red-500/10 p-3 rounded-xl text-xs text-red-400">⚠️ {pumpError}</div>}
+
+                <div className="space-y-2.5">
+                  {processedPumpTokens.map((token) => {
+                    const isSaved = watchlist.some(item => item.pairAddress === token.pairAddress);
+                    return (
+                      <div key={token.pairAddress} onClick={() => setSelectedCoin(token)} className="bg-gray-900 border border-orange-500/20 p-3.5 rounded-2xl cursor-pointer">
+                        <div className="flex justify-between">
+                          <h3 className="font-bold text-sm">{token.baseToken?.name}</h3>
+                          <button onClick={(e) => toggleWatchlist(token, e)} className={isSaved ? 'text-amber-400' : 'text-gray-500'}>⭐</button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 mt-2 text-xs">
+                          <div>Preis: {formatUSD(token.priceUsd)}</div>
+                          <div>Liq: {formatUSD(token.liquidity?.usd)}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* TAB: WATCHLIST */}
+            {activeTab === 'watchlist' && (
+              <div className="space-y-3">
+                <h2 className="text-base font-bold">Watchlist ({watchlist.length})</h2>
+                {watchlistTokens.map((token) => (
+                  <div key={token.pairAddress} onClick={() => setSelectedCoin(token)} className="bg-gray-900 border border-gray-800 p-3.5 rounded-2xl cursor-pointer">
+                    <div className="flex justify-between">
+                      <span className="font-bold text-sm">{token.baseToken?.name}</span>
+                      <button onClick={(e) => toggleWatchlist(token, e)} className="text-amber-400">⭐</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* DEMO TABS */}
+            {activeTab === 'sniper' && <div className="bg-gray-900 p-5 rounded-2xl text-center text-xs text-gray-400">🎯 Sniper (Demo-Modus)</div>}
+            {activeTab === 'wallet' && <div className="bg-gray-900 p-5 rounded-2xl text-center text-xs text-gray-400">👛 Wallet (Demo-Modus)</div>}
+            {activeTab === 'premium' && <div className="bg-gray-900 p-5 rounded-2xl text-center text-xs text-gray-400">👑 MEMECOIN AI PRO ($19.99/mo)</div>}
+          </main>
+
+          {/* DETAIL MODAL */}
+          {selectedCoin && (
+            <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center p-4">
+              <div className="bg-gray-900 border border-gray-800 w-full max-w-md rounded-2xl p-5 space-y-4 max-h-[85vh] overflow-y-auto">
+                <div className="flex justify-between items-center border-b border-gray-800 pb-2">
+                  <h2 className="font-bold text-sm">{selectedCoin.baseToken?.name}</h2>
+                  <button onClick={() => setSelectedCoin(null)} className="text-gray-400">✕</button>
+                </div>
+                <div className="text-xs space-y-2">
+                  <div>Preis: <span className="font-mono">{formatUSD(selectedCoin.priceUsd)}</span></div>
+                  <div>Liquidität: <span className="font-mono">{formatUSD(selectedCoin.liquidity?.usd)}</span></div>
+                </div>
+                <div className="space-y-2 pt-2 border-t border-gray-800">
+                  <h3 className="text-xs font-bold text-indigo-300">💬 KI-Assistent</h3>
+                  <div className="bg-gray-950 p-3 rounded-xl h-24 overflow-y-auto space-y-1 text-xs">
+                    {chatMessages.map((m, i) => <div key={i}><b>{m.sender}:</b> {m.text}</div>)}
+                  </div>
+                  <div className="flex gap-2">
+                    <input type="text" value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="Frage stellen..." className="flex-1 bg-gray-950 border border-gray-800 rounded-xl px-3 py-2 text-xs text-white" />
+                    <button onClick={handleSendMessage} className="bg-indigo-600 px-3 py-2 rounded-xl text-xs font-bold">Senden</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} />
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
